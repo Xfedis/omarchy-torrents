@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "widget.torrents",
+  "name": "Torrents",
+  "version": "1.0.0",
+  "author": "Xfedis",
+  "license": "MIT",
+  "description": "Monitor and control multiple torrent clients (Transmission, qBittorrent & Deluge) from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Torrents",
+    "description": "Torrent client status, control, and uploads",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 3
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3
+      }
+    ]
+  }
+}
