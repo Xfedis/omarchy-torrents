@@ -3,7 +3,7 @@
 An [Omarchy](https://omarchy.org) bar-widget plugin that monitors and controls
 multiple torrent clients — Transmission, qBittorrent, and Deluge.
 
-![The Torrents panel downloading a Linux ISO via qBittorrent](docs/screenshot.png)
+![The Torrents panel downloading a Linux ISO via qBittorrent](preview.png)
 
 ## Features
 
