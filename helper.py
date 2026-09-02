@@ -28,19 +28,21 @@ CONFIG_PATH = CONFIG_DIR / "config.toml"
 
 
 def ensure_config_dir():
-    # 0700: config.toml can carry a plaintext password fallback (see
-    # save_clients()), so the directory itself shouldn't be listable by
-    # other local users either.
+    # 0700: config.toml lists each client's host/port/username, which
+    # shouldn't be listable by other local users either.
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(CONFIG_DIR, 0o700)
 
 
 KINDS = ("transmission", "qbittorrent", "deluge")
 
-# Passwords are kept out of config.toml and stored in the desktop's Secret
-# Service (gnome-keyring/kwallet via secret-tool) instead, keyed by client id.
-# A plaintext "password" field in a client's TOML entry is only ever a
-# fallback for when the keyring is unavailable/locked at save time.
+# Passwords never touch config.toml. They live only in the desktop's Secret
+# Service -- GNOME Keyring by default on Omarchy (gnome-keyring-daemon,
+# unlocked via PAM at login; KWallet works too) -- accessed via secret-tool
+# and keyed by client id. There is no plaintext fallback: if the keyring
+# can't take a password (missing secret-tool, locked, timeout, ...),
+# save_clients() raises CredentialStorageError and the save is aborted
+# rather than writing the password to disk.
 SECRET_SERVICE = "omarchy-torrents"
 
 STRING_FIELDS = ("id", "name", "kind", "host", "path", "username")
@@ -52,11 +54,11 @@ BOOL_FIELDS = ("ssl",)
 # Secret Service (keyring) helpers
 # --------------------------------------------------------------------------
 # Thin wrappers around the `secret-tool` CLI (part of libsecret), which talks
-# to whatever Secret Service provider is running (gnome-keyring, KWallet,
-# ...). Every call is best-effort: on any failure these fall back to
-# returning empty/false rather than raising, so a locked or missing keyring
-# degrades to the plaintext-fallback path in save_clients()/load_clients()
-# instead of crashing the plugin.
+# to whatever Secret Service provider is running -- GNOME Keyring
+# (gnome-keyring-daemon) on a stock Omarchy install, KWallet on others.
+# Every call is best-effort: on any failure these return empty/false rather
+# than raising, so a locked or missing keyring surfaces as a normal
+# CredentialStorageError in save_clients() instead of crashing the plugin.
 
 def keyring_available():
     return shutil.which("secret-tool") is not None
@@ -100,12 +102,20 @@ class BackendError(Exception):
     pass
 
 
+class CredentialStorageError(Exception):
+    """Raised when a password can't be stored in the Secret Service. There
+    is no plaintext fallback, so this always aborts the save."""
+
+
 def out(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
 
 
-def fail(message):
-    out({"ok": False, "error": str(message)})
+def fail(message, code=None):
+    payload = {"ok": False, "error": str(message)}
+    if code:
+        payload["code"] = code
+    out(payload)
     return 0  # expected failures are not process errors
 
 
@@ -147,19 +157,16 @@ def load_clients():
         return []
 
     clients = []
-    dirty = False
     for entry in data.get("clients", []):
         if not isinstance(entry, dict) or "id" not in entry:
             continue
         client_id = str(entry.get("id", ""))
-        plaintext_password = str(entry.get("password", ""))
-        password = secret_lookup(client_id)
-        if not password and plaintext_password:
-            # Self-heal: a password left in the file (e.g. from before the
-            # keyring was wired up) gets moved into the keyring on next save.
-            password = plaintext_password
-            if secret_store(client_id, f"Omarchy Torrents: {entry.get('name') or client_id}", plaintext_password):
-                dirty = True
+        # The keyring is the only source of truth for a password. A
+        # "password" field in the TOML entry itself (e.g. hand-edited, or
+        # left over from a config.toml predating this plugin's Secret
+        # Service integration) is never read -- there is no code path left
+        # that stores one, so honoring one here would be the one remaining
+        # way a plaintext password could still get used.
         clients.append({
             "id": client_id,
             "name": str(entry.get("name", "")),
@@ -168,11 +175,9 @@ def load_clients():
             "port": int(entry.get("port", 0) or 0),
             "path": str(entry.get("path", "")),
             "username": str(entry.get("username", "")),
-            "password": password,
+            "password": secret_lookup(client_id),
             "ssl": bool(entry.get("ssl", False)),
         })
-    if dirty:
-        save_clients(clients)
     return clients
 
 
@@ -181,16 +186,27 @@ def save_clients(clients, keyring_id=None):
     # secret re-written; every other entry's password is already correct in
     # the keyring from its own last save, so touching it again here would
     # just be a wasted secret-tool round trip per unrelated client.
+    #
+    # Fail-closed, unconditionally: if that one client has a password to
+    # store and the keyring can't take it (missing secret-tool, locked,
+    # timeout, ...), the whole save is aborted -- nothing is written. There
+    # is no plaintext fallback and no opt-in to one; a password is either in
+    # the Secret Service or it isn't saved at all.
     ensure_config_dir()
     lines = []
     for c in clients:
         password = c.get("password", "")
-        stored_in_keyring = True
         if c["id"] == keyring_id:
-            stored_in_keyring = False
             if password:
                 label = f"Omarchy Torrents: {c.get('name') or c.get('id')}"
-                stored_in_keyring = secret_store(c["id"], label, password)
+                if not secret_store(c["id"], label, password):
+                    raise CredentialStorageError(
+                        "Secure credential storage is unavailable.\n"
+                        "Secret-tool is missing, the keyring is locked, or the "
+                        "request timed out or failed.\n"
+                        "The password was not saved. Unlock or start your keyring "
+                        "and try again."
+                    )
             elif keyring_available():
                 secret_clear(c["id"])
 
@@ -201,13 +217,17 @@ def save_clients(clients, keyring_id=None):
             lines.append(f"{key} = {int(c.get(key, 0) or 0)}")
         for key in BOOL_FIELDS:
             lines.append(f"{key} = {'true' if c.get(key) else 'false'}")
-        if password and not stored_in_keyring:
-            # Keyring unavailable/locked: fall back to the file rather than
-            # silently dropping the password.
-            lines.append(f'password = "{toml_escape(password)}"')
         lines.append("")
-    CONFIG_PATH.write_text("\n".join(lines) + "\n")
-    os.chmod(CONFIG_PATH, 0o600)
+
+    # Create/truncate with 0600 from the first syscall rather than writing
+    # then chmod'ing after: the latter would leave a brief window where a
+    # newly-created file sits at the umask's default (often world-readable)
+    # mode. config.toml never holds a password, but the file lists hosts,
+    # ports, and usernames, which don't belong to other local users either.
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(CONFIG_PATH, 0o600)  # belt-and-suspenders for a pre-existing file
 
 
 def public_client(c):
@@ -785,7 +805,10 @@ def cmd_add_client(args):
         clients.append(new_fields)
         changed_id = new_fields["id"]
 
-    save_clients(clients, keyring_id=changed_id)
+    try:
+        save_clients(clients, keyring_id=changed_id)
+    except CredentialStorageError as e:
+        return fail(e, code="keyring_unavailable")
     out({"ok": True, "clients": [public_client(c) for c in clients]})
     return 0
 

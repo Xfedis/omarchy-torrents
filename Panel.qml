@@ -87,6 +87,8 @@ Panel {
     formPassword = ""
     formSsl = false
     torrents.probeResult = null
+    torrents.clientFormError = ""
+    torrents.credentialStorageBlocked = false
     showSettings = true
   }
 
@@ -101,12 +103,16 @@ Panel {
     formPassword = ""
     formSsl = !!c.ssl
     torrents.probeResult = null
+    torrents.clientFormError = ""
+    torrents.credentialStorageBlocked = false
     showSettings = true
   }
 
   function closeClientForm() {
     editingClient = null
     torrents.probeResult = null
+    torrents.clientFormError = ""
+    torrents.credentialStorageBlocked = false
   }
 
   function currentFormFields() {
@@ -126,6 +132,14 @@ Panel {
     formSubmitted = true
     formWasNewClient = !(editingClient && editingClient.id)
     torrents.saveClient(currentFormFields(), (editingClient && editingClient.id) ? editingClient.id : "")
+  }
+
+  // Dismisses the blocking "secure storage unavailable" warning. There is
+  // no plaintext fallback to opt into -- this just acknowledges the error
+  // so the user can retry once their keyring is working.
+  function dismissCredentialStorageWarning() {
+    torrents.clientFormError = ""
+    torrents.credentialStorageBlocked = false
   }
 
   function submitMagnet() {
@@ -157,7 +171,7 @@ Panel {
     function onBusyOpChanged() {
       if (root.formSubmitted && torrents.busyOp === "") {
         root.formSubmitted = false
-        if (torrents.actionMessage === "") {
+        if (torrents.clientFormError === "") {
           root.closeClientForm()
           if (root.formWasNewClient) {
             root.showSettings = false
@@ -177,6 +191,7 @@ Panel {
     if (torrents.clients.length === 0) showSettings = true
   } else {
     confirmKind = ""
+    dismissCredentialStorageWarning()
   }
 
   BarIconButton {
@@ -205,7 +220,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.confirmKind !== ""
+      blocked: root.confirmKind !== "" || torrents.credentialStorageBlocked
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
@@ -652,6 +667,21 @@ Panel {
                 wrapMode: Text.WordWrap
               }
 
+              // credentialStorageBlocked gets its own blocking modal
+              // (credentialStorageWarning, below) so it can't be missed or
+              // auto-dismissed; this inline text is only for other failures
+              // (validation, unreachable host, etc.) that don't need a
+              // blocking decision.
+              Text {
+                visible: torrents.clientFormError !== "" && !torrents.credentialStorageBlocked
+                width: parent.width
+                text: torrents.clientFormError
+                color: root.urgentColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+
               RowLayout {
                 width: parent.width
                 spacing: Style.space(8)
@@ -701,6 +731,59 @@ Panel {
           if (root.confirmKind === "remove-torrent") torrents.torrentAction([root.confirmTargetId], "remove")
           else if (root.confirmKind === "remove-client") torrents.removeClient(root.confirmTargetId)
           root.confirmKind = ""
+        }
+      }
+
+      // Blocking "secure storage unavailable" warning: there is no
+      // plaintext fallback to offer, so this is a plain acknowledgment --
+      // it has no scrim-click or Escape dismissal (see keyCatcher.blocked
+      // above), only the Ok button clears it.
+      Item {
+        id: credentialStorageWarning
+        anchors.fill: parent
+        visible: torrents.credentialStorageBlocked
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(Color.background, 0.7)
+        }
+
+        Rectangle {
+          id: warningCard
+          width: Math.min(parent.width - Style.space(32), Style.space(370))
+          height: warningColumn.implicitHeight + Style.space(36)
+          anchors.centerIn: parent
+          color: Color.popups.background
+          radius: Style.cornerRadius
+          border.color: root.urgentColor
+          border.width: Style.normalBorderWidth
+
+          Column {
+            id: warningColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(18)
+            spacing: Style.space(14)
+
+            Text {
+              width: parent.width
+              text: torrents.clientFormError
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              anchors.right: parent.right
+              text: "Ok"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.dismissCredentialStorageWarning()
+            }
+          }
         }
       }
     }

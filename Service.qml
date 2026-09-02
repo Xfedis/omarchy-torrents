@@ -89,6 +89,14 @@ Item {
   property var probeResult: null  // { ok, error, torrentCount } or null while pending
   property bool probing: false
 
+  // ---- add/edit client form feedback -----------------------------------
+  // Kept separate from actionMessage (which only renders in the torrents
+  // view, not the settings form) and never auto-cleared by a timer, so a
+  // save failure stays visible until the user retries, cancels, or -- for
+  // credentialStorageBlocked -- dismisses the blocking warning dialog.
+  property string clientFormError: ""
+  property bool credentialStorageBlocked: false  // true: last save failed because secure storage was unavailable (no plaintext fallback exists)
+
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
@@ -184,6 +192,8 @@ Item {
   function saveClient(fields, existingId) {
     if (busyOp !== "") return
     busyOp = "save-client"
+    clientFormError = ""
+    credentialStorageBlocked = false
     _savedNewClient = !existingId
     var args = ["add-client", "--name", fields.name, "--kind", fields.kind,
                 "--host", fields.host, "--port", String(fields.port),
@@ -347,7 +357,12 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.busyOp = ""
+        // clientFormError/credentialStorageBlocked must be settled *before*
+        // busyOp is cleared: Panel's onBusyOpChanged handler reads
+        // clientFormError synchronously as soon as busyOp changes, so
+        // clearing busyOp first raced it against an empty, stale value and
+        // let the form close (or the warning vanish) before the real
+        // failure was ever recorded.
         var parsed = Model.parseJsonLine(text)
         if (parsed && parsed.ok) {
           root.clients = parsed.clients || []
@@ -358,11 +373,13 @@ Item {
             root.selectedClientId = root.clients[root.clients.length - 1].id
           }
           root.ensureSelectedClient()
-          root.actionMessage = ""
+          root.clientFormError = ""
+          root.credentialStorageBlocked = false
         } else {
-          root.actionMessage = "Failed to save client: " + (parsed ? parsed.error : "unknown error")
-          actionMessageTimer.restart()
+          root.clientFormError = parsed ? parsed.error : "unknown error"
+          root.credentialStorageBlocked = !!(parsed && parsed.code === "keyring_unavailable")
         }
+        root.busyOp = ""
       }
     }
   }
