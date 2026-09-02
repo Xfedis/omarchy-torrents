@@ -12,11 +12,6 @@ multiple torrent clients — Transmission, qBittorrent, and Deluge.
 - Add torrents by magnet link or by uploading a `.torrent` file.
 - Pause, resume, and remove torrents.
 - Toggle each client's alternative ("turtle") speed limits from the panel.
-- Credentials are stored only in the desktop's Secret Service — GNOME
-  Keyring by default on Omarchy, KWallet also supported — never in the
-  config file. If that's unavailable, saving fails with a clear, blocking
-  warning instead of writing the password to disk; there is no plaintext
-  fallback.
 
 ## Installation
 
@@ -39,11 +34,7 @@ To remove: `omarchy plugin remove widget.torrents`.
 
 - Python 3.11+ (for `tomllib`, used to read the plugin's config file).
 - `secret-tool` (part of `libsecret`), with a working Secret Service
-  provider unlocked — GNOME Keyring (`gnome-keyring-daemon`) is Omarchy's
-  default and is unlocked automatically via PAM at login; KWallet also
-  works. Without it, adding or editing a client with a password fails
-  outright — there is no plaintext fallback, so `config.toml` never holds a
-  password.
+  provider unlocked.
 
 ## Configuration
 
