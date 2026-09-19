@@ -14,8 +14,11 @@ import json
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -25,6 +28,15 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "omarchy-torrents"
 CONFIG_PATH = CONFIG_DIR / "config.toml"
+
+# Caps and deadlines applied throughout this file so a slow, huge, or
+# malicious response/file can degrade a single call rather than hang the
+# helper or exhaust memory. All are generous for this plugin's real inputs
+# (a handful of client records, small .torrent files, backend status JSON).
+MAX_CONFIG_FILE_BYTES = 1 * 1024 * 1024
+MAX_TORRENT_FILE_BYTES = 32 * 1024 * 1024
+MAX_HTTP_RESPONSE_BYTES = 16 * 1024 * 1024
+HELPER_TIMEOUT_SECONDS = 25
 
 
 def ensure_config_dir():
@@ -136,6 +148,32 @@ def toml_escape(s):
     )
 
 
+def read_bounded_file(path, max_bytes):
+    """Reads a regular file's full contents, rejecting symlinks (O_NOFOLLOW)
+    and anything over max_bytes before it's fully buffered in memory or
+    handed to a parser. Raises OSError (FileNotFoundError included) on any
+    problem; every caller here already treats a missing/bad file as empty."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"Not a regular file: {path}")
+        if st.st_size > max_bytes:
+            raise OSError(f"File too large: {path}")
+        with os.fdopen(fd, "rb") as f:
+            fd = None  # fdopen owns it now; don't close it twice
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise OSError(f"File too large: {path}")
+        return data
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def slugify(name, existing_ids):
     base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "client"
     slug = base
@@ -147,13 +185,9 @@ def slugify(name, existing_ids):
 
 
 def load_clients():
-    if not CONFIG_PATH.exists():
-        return []
-
     try:
-        with open(CONFIG_PATH, "rb") as f:
-            data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
+        data = tomllib.loads(read_bounded_file(CONFIG_PATH, MAX_CONFIG_FILE_BYTES).decode("utf-8"))
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
         return []
 
     clients = []
@@ -258,9 +292,8 @@ DELUGE_ALT_UP_LIMIT_KIB = 50
 
 def load_deluge_alt_state():
     try:
-        with open(DELUGE_ALT_STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
+        return json.loads(read_bounded_file(DELUGE_ALT_STATE_PATH, MAX_CONFIG_FILE_BYTES))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
 
 
@@ -274,7 +307,29 @@ def save_deluge_alt_state(state):
 # HTTP helpers (stdlib only)
 # --------------------------------------------------------------------------
 
-def http_request(url, method="GET", data=None, headers=None, timeout=10):
+def _read_bounded(resp, max_bytes, per_read_timeout):
+    # Caps how much of a response body we'll buffer, and separately bounds
+    # the total wall-clock time spent reading it. urlopen's own `timeout`
+    # only bounds each individual socket operation, so an endpoint trickling
+    # a few bytes at a time just under that timeout could otherwise stall
+    # the helper indefinitely without ever exceeding a single read's limit.
+    deadline = time.monotonic() + max(per_read_timeout, 1) * 3
+    chunks = []
+    total = 0
+    while True:
+        if time.monotonic() > deadline:
+            raise BackendError("Response timed out")
+        chunk = resp.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise BackendError("Response too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def http_request(url, method="GET", data=None, headers=None, timeout=10, max_bytes=MAX_HTTP_RESPONSE_BYTES):
     # Returns the response headers as the native email.message.Message
     # object rather than a plain dict: HTTP header names are case-insensitive
     # and Message.get() honors that, but dict(resp.headers) would flatten it
@@ -283,10 +338,11 @@ def http_request(url, method="GET", data=None, headers=None, timeout=10):
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read()
+            body = _read_bounded(resp, max_bytes, timeout)
             return resp.status, resp.headers, body
     except urllib.error.HTTPError as e:
-        return e.code, e.headers if e.headers is not None else {}, e.read()
+        body = _read_bounded(e, max_bytes, timeout)
+        return e.code, e.headers if e.headers is not None else {}, body
     except urllib.error.URLError as e:
         raise BackendError(f"Connection failed: {e.reason}")
     except OSError as e:
@@ -745,8 +801,18 @@ def cmd_clients(args):
     return 0
 
 
-def client_args_to_dict(args):
-    password = args.password
+def read_password_stdin():
+    line = sys.stdin.readline()
+    # readline() keeps the trailing newline the caller always writes; a
+    # password containing a literal newline still isn't representable over
+    # this channel, matching the old argv-based behavior which couldn't
+    # carry one either.
+    if line.endswith("\n"):
+        line = line[:-1]
+    return line
+
+
+def client_args_to_dict(args, password):
     return {
         "name": args.name or "",
         "kind": args.kind,
@@ -760,6 +826,7 @@ def client_args_to_dict(args):
 
 
 def cmd_probe(args):
+    password = read_password_stdin() if args.password_stdin else None
     if args.id:
         clients = load_clients()
         existing = find_client(clients, args.id)
@@ -771,11 +838,11 @@ def cmd_probe(args):
         # password means "keep testing with what's already stored" rather
         # than testing with no credentials at all.
         client = dict(existing)
-        client.update(client_args_to_dict(args))
-        if not args.password:
+        client.update(client_args_to_dict(args, password))
+        if not password:
             client["password"] = existing.get("password", "")
     else:
-        client = client_args_to_dict(args)
+        client = client_args_to_dict(args, password)
         client["id"] = "__probe__"
     try:
         backend = make_backend(client)
@@ -788,14 +855,15 @@ def cmd_probe(args):
 
 def cmd_add_client(args):
     clients = load_clients()
-    new_fields = client_args_to_dict(args)
+    password = read_password_stdin() if args.password_stdin else None
+    new_fields = client_args_to_dict(args, password)
 
     if args.id:
         existing = find_client(clients, args.id)
         if not existing:
             return fail(f"No client with id {args.id}")
         # Keep the stored password when the caller didn't supply a new one.
-        if args.password is None:
+        if password is None:
             new_fields["password"] = existing.get("password", "")
         existing.update(new_fields)
         changed_id = args.id
@@ -867,14 +935,16 @@ def cmd_add_file(args):
     client = find_client(clients, args.id)
     if not client:
         return fail(f"No client with id {args.id}")
-    path = Path(args.path)
-    if not path.is_file():
-        return fail(f"File not found: {args.path}")
     try:
-        data = path.read_bytes()
-        make_backend(client).add_torrent_file(data, path.name)
+        data = read_bounded_file(args.path, MAX_TORRENT_FILE_BYTES)
+    except FileNotFoundError:
+        return fail(f"File not found: {args.path}")
+    except OSError as e:
+        return fail(e)
+    try:
+        make_backend(client).add_torrent_file(data, Path(args.path).name)
         out({"ok": True})
-    except (BackendError, OSError) as e:
+    except BackendError as e:
         return fail(e)
     return 0
 
@@ -926,11 +996,12 @@ def parse_args():
         p.add_argument("--port", type=int)
         p.add_argument("--path", default="")
         p.add_argument("--username", default="")
-        # Passed as a plain argument rather than over stdin: briefly visible
-        # to other local processes (e.g. via `ps`) for this short-lived call,
-        # an accepted tradeoff on a single-user desktop -- a stdin-based
-        # approach was tried first but deadlocked in practice.
-        p.add_argument("--password")
+        # The password itself never goes on argv -- any local process can
+        # read another process's command line (e.g. /proc/<pid>/cmdline),
+        # so it goes over stdin instead. This flag means "read exactly one
+        # line from stdin as the password"; its absence (editing with an
+        # untouched password field) means "no password change".
+        p.add_argument("--password-stdin", action="store_true")
         p.add_argument("--ssl", action="store_true")
 
     p_probe = sub.add_parser("probe")
@@ -969,7 +1040,22 @@ def parse_args():
 # Entry point
 # --------------------------------------------------------------------------
 
+def _on_timeout(signum, frame):
+    # A hard backstop independent of any per-request timeout already passed
+    # to http_request/subprocess.run: whatever the cause (a stuck DNS
+    # lookup, a backend trickling bytes forever, ...), this guarantees the
+    # helper itself can't hang past HELPER_TIMEOUT_SECONDS. os._exit skips
+    # further Python-level cleanup that could itself block.
+    try:
+        out({"ok": False, "error": "Helper timed out"})
+    finally:
+        os._exit(1)
+
+
 def main():
+    if hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _on_timeout)
+        signal.alarm(HELPER_TIMEOUT_SECONDS)
     args = parse_args()
     handlers = {
         "clients": cmd_clients,

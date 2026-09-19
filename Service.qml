@@ -134,7 +134,34 @@ Item {
 
   function runHelper(process, args) {
     process.command = ["python3", root.helperPath].concat(args)
+    process.startedAt = Date.now()
     process.running = true
+  }
+
+  // helper.py enforces its own hard deadline (SIGALRM) and exits cleanly on
+  // its own, but this is a backstop for the case where the process never
+  // starts cleanly or that signal handling doesn't fire for some reason --
+  // without it a wedged helper process would leave busyOp/loading stuck
+  // forever with no way for the panel to recover. Comfortably above
+  // helper.py's own HELPER_TIMEOUT_SECONDS so that fires first in the
+  // normal case and reports a clean JSON error.
+  readonly property int helperTimeoutMs: 30000
+
+  Timer {
+    interval: 2000
+    repeat: true
+    running: true
+    onTriggered: {
+      var now = Date.now()
+      var procs = [clientsProc, statusProc, magnetProc, fileAddProc, actionProc,
+                   altSpeedProc, saveClientProc, removeClientProc, probeProc, activityProc]
+      for (var i = 0; i < procs.length; i++) {
+        var p = procs[i]
+        if (p.running && p.startedAt && (now - p.startedAt) > root.helperTimeoutMs) {
+          p.running = false
+        }
+      }
+    }
   }
 
   function refreshClients() {
@@ -202,11 +229,15 @@ Item {
     if (fields.ssl) args.push("--ssl")
     // Editing with a blank password field means "keep the saved password"
     // (that's what the form's placeholder promises) -- only send a password
-    // when adding a new client or when the user actually typed one in.
-    // See helper.py's --password definition for why this goes over argv.
+    // when adding a new client or when the user actually typed one in. The
+    // password itself goes over stdin (see saveClientProc's onStarted),
+    // never argv, so it's never visible in another local process's view of
+    // this process's command line (e.g. /proc/<pid>/cmdline).
     var sendPassword = !existingId || (fields.password !== undefined && fields.password !== null && fields.password !== "")
-    if (sendPassword) args = args.concat(["--password", fields.password || ""])
+    if (sendPassword) args.push("--password-stdin")
+    saveClientProc.pendingStdin = fields.password || ""
     saveClientProc.command = ["python3", root.helperPath].concat(args)
+    saveClientProc.startedAt = Date.now()
     saveClientProc.running = true
   }
 
@@ -221,16 +252,19 @@ Item {
   // fields as above, no id (ad-hoc test before saving).
   // existingId: pass the client being edited so a blank password field
   // tests against the already-saved password instead of no credentials.
-  // See helper.py's --password definition for why it goes over argv.
+  // The password goes over stdin (see probeProc's onStarted), never argv --
+  // see saveClient() above for why.
   function probeConnection(fields, existingId) {
     probeResult = null
     probing = true
     var args = ["probe", "--kind", fields.kind, "--host", fields.host, "--port", String(fields.port),
                 "--path", fields.path || "", "--username", fields.username || "",
-                "--password", fields.password || ""]
+                "--password-stdin"]
     if (fields.ssl) args.push("--ssl")
     if (existingId) args = args.concat(["--id", existingId])
+    probeProc.pendingStdin = fields.password || ""
     probeProc.command = ["python3", root.helperPath].concat(args)
+    probeProc.startedAt = Date.now()
     probeProc.running = true
   }
 
@@ -253,6 +287,7 @@ Item {
 
   Process {
     id: clientsProc
+    property double startedAt: 0
     stdout: StdioCollector {
       id: clientsStdout
       waitForEnd: true
@@ -271,6 +306,7 @@ Item {
 
   Process {
     id: statusProc
+    property double startedAt: 0
     stdout: StdioCollector {
       id: statusStdout
       waitForEnd: true
@@ -297,6 +333,7 @@ Item {
 
   Process {
     id: magnetProc
+    property double startedAt: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -311,6 +348,7 @@ Item {
 
   Process {
     id: fileAddProc
+    property double startedAt: 0
     stdout: StdioCollector { id: fileAddStdout; waitForEnd: true }
     stderr: StdioCollector { id: fileAddStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -324,6 +362,7 @@ Item {
 
   Process {
     id: actionProc
+    property double startedAt: 0
     stdout: StdioCollector { id: actionStdout; waitForEnd: true }
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -339,6 +378,7 @@ Item {
 
   Process {
     id: altSpeedProc
+    property double startedAt: 0
     stdout: StdioCollector { id: altSpeedStdout; waitForEnd: true }
     stderr: StdioCollector { id: altSpeedStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -354,6 +394,19 @@ Item {
 
   Process {
     id: saveClientProc
+    property double startedAt: 0
+    // The password goes over stdin, never argv -- see saveClient() above.
+    // Always writing (even an empty line) regardless of whether
+    // --password-stdin was actually passed is deliberate: helper.py simply
+    // never reads it when the flag is absent, and a single short line left
+    // unread in the pipe is harmless (well under the kernel pipe buffer),
+    // so there's no need to track whether a read is expected here too.
+    property string pendingStdin: ""
+    stdinEnabled: true
+    onStarted: {
+      write(pendingStdin + "\n")
+      pendingStdin = ""
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -386,6 +439,7 @@ Item {
 
   Process {
     id: removeClientProc
+    property double startedAt: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -403,6 +457,15 @@ Item {
 
   Process {
     id: probeProc
+    property double startedAt: 0
+    // See saveClientProc above: always written, only read by helper.py when
+    // --password-stdin (always passed by probeConnection()) is present.
+    property string pendingStdin: ""
+    stdinEnabled: true
+    onStarted: {
+      write(pendingStdin + "\n")
+      pendingStdin = ""
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -415,6 +478,7 @@ Item {
 
   Process {
     id: activityProc
+    property double startedAt: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
