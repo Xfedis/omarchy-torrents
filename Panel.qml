@@ -457,6 +457,75 @@ Panel {
                 boundsBehavior: Flickable.StopAtBounds
                 model: torrents.torrents
 
+                // Keep the view anchored when the model is reassigned on every
+                // poll (and after removing a row). Without this the view jumps
+                // back to the active torrents at the top, so a click aimed at a
+                // row at the bottom could hit a different torrent's controls.
+                // lastY mirrors contentY but ignores the collapse to ~0 that a
+                // model reset produces. When a reset lands, the position is
+                // restored immediately (callLater) and again after a short
+                // grace timer, in case the reset settles later than the signal.
+                property real lastY: 0
+                property real lastCH: 0
+                property bool resetArmed: false
+
+                onContentYChanged: {
+                  if (resetArmed) {
+                    // a model reset is in flight: hold the position against
+                    // whatever clamps the view back to the top, but never
+                    // fight the user's own scrolling
+                    if (!dragging && !moving && lastY > 1) {
+                      var target = Math.min(lastY, Math.max(0, lastCH - height))
+                      if (contentY < target - 1)
+                        contentY = target
+                    }
+                    // scrolling down during the window is the user's move
+                    if (contentY > lastY) {
+                      lastY = contentY
+                      lastCH = contentHeight
+                    }
+                  } else if (contentY > 1) {
+                    lastY = contentY
+                    lastCH = contentHeight
+                  }
+                }
+
+                Connections {
+                  target: torrents
+                  function onTorrentsChanged() {
+                    resetArmed = true
+                    resetGraceTimer.restart()
+                    // the view has already collapsed to the top by the time
+                    // this fires: restore now and once the batch settles
+                    torrentList.restoreAnchor()
+                    Qt.callLater(torrentList.restoreAnchor)
+                  }
+                }
+
+                onCountChanged: {
+                  resetArmed = true
+                  resetGraceTimer.restart()
+                  torrentList.restoreAnchor()
+                }
+
+                Timer {
+                  id: resetGraceTimer
+                  interval: 80
+                  onTriggered: {
+                    torrentList.restoreAnchor()
+                    torrentList.resetArmed = false
+                  }
+                }
+
+                function restoreAnchor() {
+                  if (lastY > 1 && contentY < lastY) {
+                    var target = Math.min(lastY, Math.max(0, lastCH - height))
+                    if (contentY < target - 1) {
+                      contentY = target
+                    }
+                  }
+                }
+
                 delegate: TorrentRow {
                   required property var modelData
                   width: torrentList.width
