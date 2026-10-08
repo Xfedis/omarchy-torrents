@@ -19,6 +19,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Panel {
@@ -26,8 +27,8 @@ Panel {
   moduleName: "widget.torrents"
   ipcTarget: "widget.torrents"
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgentColor: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color urgentColor: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -40,7 +41,7 @@ Panel {
   }
   readonly property color barIconColor: torrents.clients.length === 0
     ? Qt.darker(barForeground, 1.7)
-    : (anyActive ? Color.accent : barForeground)
+    : (anyActive ? Commons.Color.accent : barForeground)
 
   // ---- client add/edit form state ----
   // The form* properties mirror one client's fields while the add/edit
@@ -280,7 +281,7 @@ Panel {
                 visible: !root.showSettings && !!torrents.selectedClient
                 iconText: ""
                 tooltipText: (torrents.altSpeedEnabled ? "Turn off" : "Turn on") + " temporary speed limit"
-                foreground: torrents.altSpeedEnabled ? Color.accent : Qt.darker(root.foreground, 2.0)
+                foreground: torrents.altSpeedEnabled ? Commons.Color.accent : Qt.darker(root.foreground, 2.0)
                 fontFamily: root.fontFamily
                 enabled: !torrents.altSpeedBusy
                 onClicked: torrents.toggleAltSpeed()
@@ -482,7 +483,7 @@ Panel {
                 Rectangle {
                   anchors.fill: parent
                   radius: width / 2
-                  color: Style.hoverFillFor(root.foreground, Color.accent)
+                  color: Style.hoverFillFor(root.foreground, Commons.Color.accent)
                 }
 
                 Rectangle {
@@ -749,7 +750,7 @@ Panel {
         message: root.confirmMessage
         confirmText: "Remove"
         foreground: root.foreground
-        background: Color.popups.background
+        background: Commons.Color.popups.background
         onCanceled: root.confirmKind = ""
         onConfirmed: {
           if (root.confirmKind === "remove-torrent") torrents.torrentAction([root.confirmTargetId], "remove")
@@ -769,7 +770,7 @@ Panel {
 
         Rectangle {
           anchors.fill: parent
-          color: Util.alpha(Color.background, 0.7)
+          color: Util.alpha(Commons.Color.background, 0.7)
         }
 
         Rectangle {
@@ -777,7 +778,7 @@ Panel {
           width: Math.min(parent.width - Style.space(32), Style.space(370))
           height: warningColumn.implicitHeight + Style.space(36)
           anchors.centerIn: parent
-          color: Color.popups.background
+          color: Commons.Color.popups.background
           radius: Style.cornerRadius
           border.color: root.urgentColor
           border.width: Style.normalBorderWidth
@@ -851,7 +852,7 @@ Panel {
     property var torrent: null
     readonly property var statusInfo: Model.statusInfo(torrent ? torrent.status : "unknown")
     readonly property color statusColor: {
-      if (statusInfo.role === "accent") return Color.accent
+      if (statusInfo.role === "accent") return Commons.Color.accent
       if (statusInfo.role === "urgent") return root.urgentColor
       if (statusInfo.role === "foreground") return root.foreground
       return root.dim
@@ -862,7 +863,7 @@ Panel {
 
     implicitHeight: content.implicitHeight + Style.space(16)
     radius: Style.cornerRadius
-    color: rowHover.hovered ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+    color: rowHover.hovered ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : "transparent"
     borderSpec: Border.none()
 
     HoverHandler { id: rowHover }
@@ -928,7 +929,7 @@ Panel {
         Rectangle {
           anchors.fill: parent
           radius: height / 2
-          color: Style.hoverFillFor(root.foreground, Color.accent)
+          color: Style.hoverFillFor(root.foreground, Commons.Color.accent)
         }
 
         Rectangle {
