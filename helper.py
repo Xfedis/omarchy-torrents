@@ -354,6 +354,18 @@ def _read_bounded(resp, max_bytes, per_read_timeout):
     return b"".join(chunks)
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    # urllib's stock redirect handler drains each redirect response with an
+    # unbounded fp.read() before following it, which would bypass the cap in
+    # _read_bounded. None of the supported clients' APIs redirect, so refuse
+    # to follow: the 3xx surfaces as an HTTPError whose body we read bounded.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
 def http_request(url, method="GET", data=None, headers=None, timeout=10, max_bytes=MAX_HTTP_RESPONSE_BYTES):
     # Returns the response headers as the native email.message.Message
     # object rather than a plain dict: HTTP header names are case-insensitive
@@ -362,7 +374,7 @@ def http_request(url, method="GET", data=None, headers=None, timeout=10, max_byt
     # send "Set-Cookie", others "set-cookie"), silently breaking lookups.
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             body = _read_bounded(resp, max_bytes, timeout)
             return resp.status, resp.headers, body
     except urllib.error.HTTPError as e:
