@@ -86,7 +86,7 @@ Item {
 
   property string busyOp: ""  // "", "add-magnet", "add-file", "action:<op>", "save-client", "remove-client"
   property string actionMessage: ""
-  property var probeResult: null  // { ok, error, torrentCount } or null while pending
+  property var probeResult: null  // { ok, error, torrentCount, truncated } or null while pending
   property bool probing: false
 
   // ---- add/edit client form feedback -----------------------------------

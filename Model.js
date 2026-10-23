@@ -4,6 +4,12 @@
 // Deliberately has no Quickshell/QML dependencies (plain JS only), so it can
 // also be loaded and unit-tested standalone under plain Node.
 
+// Mirrors the helper's caps (MAX_TORRENTS / MAX_STATUS_OUTPUT_BYTES in
+// helper.py), so the shell stays bounded even if the helper misbehaves.
+// The helper emits ASCII-only JSON, so string length equals byte count.
+var MAX_TORRENTS = 5000
+var MAX_HELPER_OUTPUT_CHARS = 5 * 1024 * 1024
+
 var KIND_LABELS = {
   transmission: "Transmission",
   qbittorrent: "qBittorrent",
@@ -93,7 +99,13 @@ function sortGroup(status) {
 }
 
 function sortTorrents(torrents) {
-  return torrents.slice().sort(function(a, b) {
+  if (!Array.isArray(torrents)) return []
+  var bounded = []
+  for (var i = 0; i < torrents.length && bounded.length < MAX_TORRENTS; i++) {
+    var t = torrents[i]
+    if (t && typeof t === "object" && !Array.isArray(t)) bounded.push(t)
+  }
+  return bounded.sort(function(a, b) {
     var ga = sortGroup(a.status)
     var gb = sortGroup(b.status)
     if (ga !== gb) return ga - gb
@@ -102,7 +114,9 @@ function sortTorrents(torrents) {
 }
 
 function parseJsonLine(raw) {
-  var text = String(raw || "").trim()
+  var text = String(raw || "")
+  if (text.length > MAX_HELPER_OUTPUT_CHARS) return null
+  text = text.trim()
   if (text === "") return null
   // A helper invocation only ever emits one JSON object per line; if a
   // caller's stdout somehow gets multiple lines, the last one wins.

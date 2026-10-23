@@ -36,6 +36,16 @@ CONFIG_PATH = CONFIG_DIR / "config.toml"
 MAX_CONFIG_FILE_BYTES = 1 * 1024 * 1024
 MAX_TORRENT_FILE_BYTES = 32 * 1024 * 1024
 MAX_HTTP_RESPONSE_BYTES = 16 * 1024 * 1024
+# A 16 MiB response can still hold millions of tiny torrent objects, so the
+# list itself is bounded too: by item count, per-field length, and the total
+# size of what we hand to the shell.
+MAX_TORRENTS = 5000
+MAX_TORRENT_TEXT_CHARS = 1024
+MAX_STATUS_OUTPUT_BYTES = 4 * 1024 * 1024
+# json.loads turns each tiny "{}" or "[]" into a full Python object, so 16 MiB
+# of them would cost hundreds of MiB to parse. Counting brackets before
+# parsing over-counts (names contain brackets too) but never under-counts.
+MAX_JSON_CONTAINERS = 200_000
 HELPER_TIMEOUT_SECONDS = 25
 
 
@@ -122,6 +132,77 @@ def _api_key_secret_id(client_id):
 
 class BackendError(Exception):
     pass
+
+
+def _bounded_text(value):
+    if not isinstance(value, str):
+        return ""
+    return value[:MAX_TORRENT_TEXT_CHARS]
+
+
+def _finite_number(value, default):
+    # json.loads accepts NaN/Infinity, which json.dumps would then emit as
+    # bare tokens that JSON.parse rejects -- and bool is an int subclass.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if value != value or value in (float("inf"), float("-inf")):
+        return default
+    return value
+
+
+def parse_json_body(body, what):
+    if body.count(b"{") + body.count(b"[") > MAX_JSON_CONTAINERS:
+        raise BackendError(f"{what} returned too many entries")
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (ValueError, RecursionError):
+        raise BackendError(f"{what} returned an unreadable response")
+
+
+def normalize_torrents(items, convert):
+    """Turns a backend's raw torrent records into the helper's output list.
+
+    `items` yields raw records lazily and `convert` maps one record (already
+    known to be a dict) to an output dict. Non-dict records, records without
+    a usable id, records `convert` can't make sense of (wrong field types),
+    and duplicate ids are dropped; the result stops at MAX_TORRENTS
+    entries or MAX_STATUS_OUTPUT_BYTES of serialized output, whichever comes
+    first. Returns (torrents, truncated)."""
+    out_list = []
+    seen_ids = set()
+    budget = MAX_STATUS_OUTPUT_BYTES
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            t = convert(raw)
+        except (TypeError, ValueError, KeyError):
+            continue
+        torrent_id = t.get("id")
+        # Never truncate an id: a shortened one would target the wrong torrent.
+        if (not isinstance(torrent_id, str) or not torrent_id
+                or len(torrent_id) > MAX_TORRENT_TEXT_CHARS or torrent_id in seen_ids):
+            continue
+        if len(out_list) >= MAX_TORRENTS:
+            return out_list, True
+        torrent = {
+            "id": torrent_id,
+            "name": _bounded_text(t.get("name")),
+            "status": _bounded_text(t.get("status")) or "unknown",
+            "progress": min(max(_finite_number(t.get("progress"), 0.0), 0.0), 1.0),
+            "sizeBytes": max(_finite_number(t.get("sizeBytes"), 0), 0),
+            "downloadRate": max(_finite_number(t.get("downloadRate"), 0), 0),
+            "uploadRate": max(_finite_number(t.get("uploadRate"), 0), 0),
+            "eta": _finite_number(t.get("eta"), -1),
+            "ratio": _finite_number(t.get("ratio"), 0.0),
+            "error": _bounded_text(t.get("error")),
+        }
+        budget -= len(json.dumps(torrent)) + 2
+        if budget < 0:
+            return out_list, True
+        seen_ids.add(torrent_id)
+        out_list.append(torrent)
+    return out_list, False
 
 
 class CredentialStorageError(Exception):
@@ -317,9 +398,10 @@ DELUGE_ALT_UP_LIMIT_KIB = 50
 
 def load_deluge_alt_state():
     try:
-        return json.loads(read_bounded_file(DELUGE_ALT_STATE_PATH, MAX_CONFIG_FILE_BYTES))
+        state = json.loads(read_bounded_file(DELUGE_ALT_STATE_PATH, MAX_CONFIG_FILE_BYTES))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
+    return state if isinstance(state, dict) else {}
 
 
 def save_deluge_alt_state(state):
@@ -474,23 +556,25 @@ class TransmissionBackend(Backend):
                 raise BackendError("Authentication failed (check username/password)")
             if status != 200:
                 raise BackendError(f"HTTP error {status}")
-            try:
-                result = json.loads(body.decode())
-            except json.JSONDecodeError:
-                raise BackendError("Transmission returned an unreadable response")
+            result = parse_json_body(body, "Transmission")
+            if not isinstance(result, dict):
+                raise BackendError("Transmission returned an unexpected response")
             if result.get("result") != "success":
-                raise BackendError(f"RPC error: {result.get('result')}")
-            return result.get("arguments", {})
+                raise BackendError(f"RPC error: {_bounded_text(str(result.get('result')))}")
+            arguments = result.get("arguments", {})
+            return arguments if isinstance(arguments, dict) else {}
         raise BackendError("Failed to reach Transmission")
 
     def list_torrents(self):
-        torrents = self._call("torrent-get", {"fields": self.FIELDS}).get("torrents", [])
-        out_list = []
-        for t in torrents:
+        torrents = self._call("torrent-get", {"fields": self.FIELDS}).get("torrents")
+        if not isinstance(torrents, list):
+            raise BackendError("Transmission returned an unexpected torrent list")
+
+        def convert(t):
             status = self.STATUS_MAP.get(t.get("status", 0), "unknown")
             if t.get("error"):
                 status = "error"
-            out_list.append({
+            return {
                 "id": t.get("hashString", ""),
                 "name": t.get("name", ""),
                 "status": status,
@@ -501,8 +585,8 @@ class TransmissionBackend(Backend):
                 "eta": t.get("eta", -1),
                 "ratio": t.get("uploadRatio", 0.0),
                 "error": t.get("errorString", "") or "",
-            })
-        return out_list
+            }
+        return normalize_torrents(torrents, convert)
 
     def add_magnet(self, uri):
         self._call("torrent-add", {"filename": uri})
@@ -637,10 +721,12 @@ class QbittorrentBackend(Backend):
 
     def list_torrents(self):
         body = self._request("/api/v2/torrents/info")
-        torrents = json.loads(body.decode())
-        out_list = []
-        for t in torrents:
-            out_list.append({
+        torrents = parse_json_body(body, "qBittorrent")
+        if not isinstance(torrents, list):
+            raise BackendError("qBittorrent returned an unexpected torrent list")
+
+        def convert(t):
+            return {
                 "id": t.get("hash", ""),
                 "name": t.get("name", ""),
                 "status": self.STATE_MAP.get(t.get("state", ""), "unknown"),
@@ -651,8 +737,8 @@ class QbittorrentBackend(Backend):
                 "eta": t.get("eta", -1) if t.get("eta", -1) not in (8640000, 8640000000) else -1,
                 "ratio": t.get("ratio", 0.0),
                 "error": "" if t.get("state") not in ("error", "missingFiles") else "Torrent error",
-            })
-        return out_list
+            }
+        return normalize_torrents(torrents, convert)
 
     def add_magnet(self, uri):
         body, content_type = build_multipart({"urls": uri}, {})
@@ -732,8 +818,8 @@ class DelugeBackend(Backend):
         if not match:
             raise BackendError("Deluge did not return a session cookie")
         self._cookie = match.group(0)
-        result = json.loads(body.decode())
-        if result.get("error"):
+        result = parse_json_body(body, "Deluge")
+        if not isinstance(result, dict) or result.get("error"):
             raise BackendError("Deluge authentication failed (check password)")
         if result.get("result") is False:
             raise BackendError("Deluge authentication failed (check password)")
@@ -746,9 +832,12 @@ class DelugeBackend(Backend):
         if self._call("web.connected", []):
             return
         hosts = self._call("web.get_hosts", []) or []
-        if not hosts:
+        if not isinstance(hosts, list) or not hosts:
             raise BackendError("Deluge Web UI has no daemon host configured")
-        self._call("web.connect", [hosts[0][0]])
+        host = hosts[0]
+        if not isinstance(host, list) or not host or not isinstance(host[0], str):
+            raise BackendError("Deluge returned an unexpected host list")
+        self._call("web.connect", [host[0]])
 
     def _call(self, method, params, retried=False):
         if not self._cookie:
@@ -761,36 +850,44 @@ class DelugeBackend(Backend):
             return self._call(method, params, retried=True)
         if status != 200:
             raise BackendError(f"Deluge request failed (HTTP {status})")
-        try:
-            result = json.loads(body.decode())
-        except json.JSONDecodeError:
-            raise BackendError("Deluge returned an unreadable response")
-        if result.get("error"):
-            raise BackendError(str(result["error"].get("message", result["error"])))
+        result = parse_json_body(body, "Deluge")
+        if not isinstance(result, dict):
+            raise BackendError("Deluge returned an unexpected response")
+        error = result.get("error")
+        if error:
+            message = error.get("message", error) if isinstance(error, dict) else error
+            raise BackendError(_bounded_text(str(message)) or "Deluge request failed")
         return result.get("result")
 
     def list_torrents(self):
         statuses = self._call("core.get_torrents_status", [{}, self.STATUS_KEYS]) or {}
-        out_list = []
-        for torrent_id, t in statuses.items():
+        if not isinstance(statuses, dict):
+            raise BackendError("Deluge returned an unexpected torrent list")
+
+        def records():
+            for torrent_id, t in statuses.items():
+                if isinstance(t, dict):
+                    yield {**t, "_id": torrent_id}
+
+        def convert(t):
             state = t.get("state", "")
             status = self.STATE_MAP.get(state, "unknown")
             # Deluge's "message" field is a general status string (it reads
             # "OK" when everything is fine), not an error flag -- only trust
             # the dedicated "Error" state, and only surface message text then.
-            out_list.append({
-                "id": torrent_id,
+            return {
+                "id": t["_id"],
                 "name": t.get("name", ""),
                 "status": status,
-                "progress": (t.get("progress", 0.0) or 0.0) / 100.0,
+                "progress": _finite_number(t.get("progress"), 0.0) / 100.0,
                 "sizeBytes": t.get("total_wanted", 0),
                 "downloadRate": t.get("download_payload_rate", 0),
                 "uploadRate": t.get("upload_payload_rate", 0),
                 "eta": t.get("eta", -1),
                 "ratio": t.get("ratio", 0.0),
                 "error": t.get("message", "") if status == "error" else "",
-            })
-        return out_list
+            }
+        return normalize_torrents(records(), convert)
 
     def add_magnet(self, uri):
         self._call("core.add_torrent_magnet", [uri, {}])
@@ -809,21 +906,25 @@ class DelugeBackend(Backend):
                 self._call("core.remove_torrent", [torrent_id, remove_data])
 
     def get_alt_speed_enabled(self):
-        state = load_deluge_alt_state()
-        return bool(state.get(self.client["id"], {}).get("enabled"))
+        entry = load_deluge_alt_state().get(self.client["id"])
+        return isinstance(entry, dict) and bool(entry.get("enabled"))
 
     def set_alt_speed_enabled(self, enabled):
         state = load_deluge_alt_state()
         client_id = self.client["id"]
-        entry = state.get(client_id, {})
+        entry = state.get(client_id)
+        if not isinstance(entry, dict):
+            entry = {}
         if enabled:
             if entry.get("enabled"):
                 return
             config = self._call("core.get_config", []) or {}
+            if not isinstance(config, dict):
+                raise BackendError("Deluge returned an unexpected config")
             state[client_id] = {
                 "enabled": True,
-                "savedDown": config.get("max_download_speed", -1),
-                "savedUp": config.get("max_upload_speed", -1),
+                "savedDown": _finite_number(config.get("max_download_speed"), -1),
+                "savedUp": _finite_number(config.get("max_upload_speed"), -1),
             }
             self._call("core.set_config", [{
                 "max_download_speed": DELUGE_ALT_DOWN_LIMIT_KIB,
@@ -923,8 +1024,8 @@ def cmd_probe(args):
         client["id"] = "__probe__"
     try:
         backend = make_backend(client)
-        torrents = backend.list_torrents()
-        out({"ok": True, "torrentCount": len(torrents)})
+        torrents, truncated = backend.list_torrents()
+        out({"ok": True, "torrentCount": len(torrents), "truncated": truncated})
     except BackendError as e:
         return fail(e)
     return 0
@@ -982,7 +1083,7 @@ def cmd_status(args):
         return fail(f"No client with id {args.id}")
     try:
         backend = make_backend(client)
-        torrents = backend.list_torrents()
+        torrents, truncated = backend.list_torrents()
     except BackendError as e:
         return fail(e)
     try:
@@ -995,7 +1096,8 @@ def cmd_status(args):
     }
     out({
         "ok": True, "clientId": client["id"], "clientName": client["name"],
-        "torrents": torrents, "totals": totals, "altSpeedEnabled": alt_speed_enabled,
+        "torrents": torrents, "truncated": truncated,
+        "totals": totals, "altSpeedEnabled": alt_speed_enabled,
     })
     return 0
 
@@ -1155,7 +1257,14 @@ def main():
         "torrent-action": cmd_torrent_action,
         "set-alt-speed": cmd_set_alt_speed,
     }
-    return handlers[args.command](args)
+    try:
+        return handlers[args.command](args)
+    except Exception:
+        # Anything unforeseen still answers with one JSON line, so the shell
+        # shows an error instead of hanging on unparseable output.
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return fail("Unexpected helper error")
 
 
 if __name__ == "__main__":

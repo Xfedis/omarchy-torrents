@@ -44,6 +44,9 @@ Client connections are stored in `~/.config/omarchy-torrents/config.toml`
 and are managed entirely from the panel's settings screen — there's nothing
 to hand-edit.
 
+The panel lists up to 5,000 torrents per client; anything beyond that is
+left out of the list, and the per-client speed totals only count the ones shown.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

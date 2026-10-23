@@ -680,7 +680,7 @@ Panel {
                 width: parent.width
                 text: torrents.probeResult
                   ? (torrents.probeResult.ok
-                    ? ("Connected — " + torrents.probeResult.torrentCount + " torrent(s) found")
+                    ? ("Connected — " + torrents.probeResult.torrentCount + (torrents.probeResult.truncated ? "+" : "") + " torrent(s) found")
                     : ("Connection failed: " + torrents.probeResult.error))
                   : ""
                 textFormat: Text.PlainText
