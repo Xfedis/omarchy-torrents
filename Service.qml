@@ -180,7 +180,13 @@ Item {
     if (!selectedClientId || busyOp !== "") return
     busyOp = "add-magnet"
     actionMessage = "Adding magnet link…"
-    runHelper(magnetProc, ["add-magnet", "--id", selectedClientId, "--magnet", uri])
+    // The URI goes over stdin, never argv: a magnet's `tr` tracker URLs can
+    // carry credentials (passkeys), and argv is readable by other local
+    // users via /proc/<pid>/cmdline. A magnet URI never legitimately
+    // contains line breaks, so strip any a paste brought along -- the
+    // helper reads exactly one line.
+    magnetProc.pendingStdin = String(uri).replace(/[\r\n]/g, "")
+    runHelper(magnetProc, ["add-magnet", "--id", selectedClientId, "--magnet-stdin"])
   }
 
   function addTorrentFile(path) {
@@ -336,6 +342,13 @@ Item {
   Process {
     id: magnetProc
     property double startedAt: 0
+    // The magnet URI goes over stdin, never argv -- see addMagnet() above.
+    property string pendingStdin: ""
+    stdinEnabled: true
+    onStarted: {
+      write(pendingStdin + "\n")
+      pendingStdin = ""
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

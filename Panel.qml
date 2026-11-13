@@ -493,7 +493,7 @@ Panel {
                 Connections {
                   target: torrents
                   function onTorrentsChanged() {
-                    resetArmed = true
+                    torrentList.resetArmed = true
                     resetGraceTimer.restart()
                     // the view has already collapsed to the top by the time
                     // this fires: restore now and once the batch settles

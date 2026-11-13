@@ -1108,7 +1108,13 @@ def cmd_add_magnet(args):
     if not client:
         return fail(f"No client with id {args.id}")
     try:
-        make_backend(client).add_magnet(args.magnet)
+        # Always read from stdin (Service.qml writes exactly one line): the
+        # URI can embed credential-bearing tracker URLs, so it is never
+        # accepted on argv where /proc/<pid>/cmdline would expose it.
+        uri = read_stdin_line().strip()
+        if not uri:
+            return fail("No magnet link given")
+        make_backend(client).add_magnet(uri)
         out({"ok": True})
     except BackendError as e:
         return fail(e)
@@ -1207,7 +1213,9 @@ def parse_args():
 
     p_magnet = sub.add_parser("add-magnet")
     p_magnet.add_argument("--id", required=True)
-    p_magnet.add_argument("--magnet", required=True)
+    # Required marker flag: the URI itself is read from stdin, never argv
+    # (tracker URLs in it may carry credentials -- see cmd_add_magnet).
+    p_magnet.add_argument("--magnet-stdin", action="store_true", required=True)
 
     p_file = sub.add_parser("add-file")
     p_file.add_argument("--id", required=True)
