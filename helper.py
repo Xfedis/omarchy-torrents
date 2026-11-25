@@ -86,38 +86,89 @@ def keyring_available():
     return shutil.which("secret-tool") is not None
 
 
-def secret_store(client_id, label, password):
+# Every secret-tool call goes through _run_secret_tool: the child runs in its
+# own process group, its timeout never extends past the helper's global
+# deadline, and it is tracked so _on_timeout can kill it (and anything it
+# spawned) before os._exit. Without that, an alarm firing mid-lookup would
+# skip subprocess.run's cleanup and leave the secret-tool child -- and its
+# pending keyring request -- running after the helper is gone.
+SECRET_TOOL_TIMEOUT_SECONDS = 10
+# Headroom kept before the global deadline so a timed-out child can be
+# killed and reaped, and the helper can still answer, before SIGALRM.
+DEADLINE_MARGIN_SECONDS = 3
+_helper_deadline = None
+_live_children = set()
+
+
+def _remaining_budget(timeout):
+    if _helper_deadline is None:
+        return timeout
+    return min(timeout, _helper_deadline - time.monotonic() - DEADLINE_MARGIN_SECONDS)
+
+
+def _kill_group(proc):
     try:
-        proc = subprocess.run(
-            ["secret-tool", "store", "--label", label, "service", SECRET_SERVICE, "client_id", client_id],
-            input=password.encode(), capture_output=True, timeout=10,
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _run_secret_tool(argv, input_bytes=None):
+    """Run secret-tool; returns (returncode, stdout) or None on failure/timeout."""
+    timeout = _remaining_budget(SECRET_TOOL_TIMEOUT_SECONDS)
+    if timeout <= 0:
+        return None
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-        return proc.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except OSError:
+        return None
+    _live_children.add(proc)
+    try:
+        stdout, _ = proc.communicate(input=input_bytes, timeout=timeout)
+        return proc.returncode, stdout
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        try:
+            proc.communicate(timeout=1)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        return None
+    except OSError:
+        _kill_group(proc)
+        return None
+    finally:
+        # Only forget a child once it's reaped; one that somehow survived the
+        # kill stays tracked so _on_timeout gets another shot at it.
+        if proc.poll() is not None:
+            _live_children.discard(proc)
+
+
+def secret_store(client_id, label, password):
+    result = _run_secret_tool(
+        ["secret-tool", "store", "--label", label, "service", SECRET_SERVICE, "client_id", client_id],
+        input_bytes=password.encode(),
+    )
+    return result is not None and result[0] == 0
 
 
 def secret_lookup(client_id):
-    try:
-        proc = subprocess.run(
-            ["secret-tool", "lookup", "service", SECRET_SERVICE, "client_id", client_id],
-            capture_output=True, timeout=10,
-        )
-        if proc.returncode == 0:
-            return proc.stdout.decode(errors="ignore").rstrip("\n")
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    result = _run_secret_tool(
+        ["secret-tool", "lookup", "service", SECRET_SERVICE, "client_id", client_id],
+    )
+    if result is not None and result[0] == 0:
+        return result[1].decode(errors="ignore").rstrip("\n")
     return ""
 
 
 def secret_clear(client_id):
-    try:
-        subprocess.run(
-            ["secret-tool", "clear", "service", SECRET_SERVICE, "client_id", client_id],
-            capture_output=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    _run_secret_tool(
+        ["secret-tool", "clear", "service", SECRET_SERVICE, "client_id", client_id],
+    )
 
 
 # qBittorrent API keys are a second, independent secret a client can have
@@ -1242,14 +1293,23 @@ def _on_timeout(signum, frame):
     # to http_request/subprocess.run: whatever the cause (a stuck DNS
     # lookup, a backend trickling bytes forever, ...), this guarantees the
     # helper itself can't hang past HELPER_TIMEOUT_SECONDS. os._exit skips
-    # further Python-level cleanup that could itself block.
+    # further Python-level cleanup that could itself block, so any
+    # secret-tool child still running is killed (by process group) first
+    # rather than being left behind.
     try:
+        for proc in list(_live_children):
+            _kill_group(proc)
         out({"ok": False, "error": "Helper timed out"})
+        # os._exit doesn't flush stdio, and stdout is a pipe (block-buffered)
+        # when the shell runs us, so flush explicitly or this line is lost.
+        sys.stdout.flush()
     finally:
         os._exit(1)
 
 
 def main():
+    global _helper_deadline
+    _helper_deadline = time.monotonic() + HELPER_TIMEOUT_SECONDS
     if hasattr(signal, "SIGALRM"):
         signal.signal(signal.SIGALRM, _on_timeout)
         signal.alarm(HELPER_TIMEOUT_SECONDS)

@@ -62,6 +62,13 @@ Panel {
   property string formApiKey: ""
   property bool formSsl: false
   property string magnetInput: ""
+  // The writable magnet field (and the client form's fields) only exist
+  // while the user has explicitly opened them. On Qt builds without qtbase
+  // bcbfae6761016974d9185cecee333b5f7aaf0442, a live editable text field can
+  // synchronously read a compositor clipboard offer in full before any
+  // paste; keeping no such field instantiated while the panel sits idle
+  // means a clipboard offer can't stall the shared shell through it.
+  property bool magnetEditing: false
 
   // ---- shared "are you sure?" dialog state (torrent or client removal) ----
   property string confirmKind: ""  // "", "remove-torrent", "remove-client"
@@ -112,6 +119,7 @@ Panel {
   }
 
   function closeClientForm() {
+    if (editingClient) keyCatcher.forceActiveFocus()
     editingClient = null
     torrents.probeResult = null
     torrents.clientFormError = ""
@@ -150,7 +158,15 @@ Panel {
     var uri = magnetInput.trim()
     if (uri === "") return
     torrents.addMagnet(uri)
+    closeMagnetField()
+  }
+
+  function closeMagnetField() {
     magnetInput = ""
+    magnetEditing = false
+    // The focused field was just destroyed; hand focus back to the panel's
+    // key handler so Escape/Tab keep working.
+    keyCatcher.forceActiveFocus()
   }
 
   function confirmRemoveTorrent(t) {
@@ -196,6 +212,8 @@ Panel {
   } else {
     confirmKind = ""
     dismissCredentialStorageWarning()
+    closeMagnetField()
+    closeClientForm()
   }
 
   BarIconButton {
@@ -369,23 +387,54 @@ Panel {
               spacing: Style.space(8)
               visible: !!torrents.selectedClient
 
-              TextField {
-                id: magnetField
+              Loader {
+                id: magnetLoader
                 Layout.fillWidth: true
-                foreground: root.foreground
-                placeholderText: "Magnet link or .torrent URL"
-                text: root.magnetInput
-                onTextChanged: root.magnetInput = text
-                Keys.onReturnPressed: root.submitMagnet()
+                sourceComponent: root.magnetEditing ? magnetFieldComponent : magnetOpenComponent
+                onLoaded: if (root.magnetEditing) item.forceActiveFocus()
+              }
+
+              Component {
+                id: magnetOpenComponent
+                Button {
+                  text: "Add magnet link or URL…"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  enabled: torrents.busyOp === ""
+                  onClicked: root.magnetEditing = true
+                }
+              }
+
+              Component {
+                id: magnetFieldComponent
+                TextField {
+                  foreground: root.foreground
+                  placeholderText: "Magnet link or .torrent URL"
+                  text: root.magnetInput
+                  onTextChanged: root.magnetInput = text
+                  Keys.onReturnPressed: root.submitMagnet()
+                  Keys.onEscapePressed: root.closeMagnetField()
+                }
               }
 
               Button {
+                visible: root.magnetEditing
                 text: "Add"
                 bordered: true
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: root.magnetInput.trim() !== "" && torrents.busyOp === ""
                 onClicked: root.submitMagnet()
+              }
+
+              Button {
+                visible: root.magnetEditing
+                text: "Cancel"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.closeMagnetField()
               }
 
               PanelActionButton {
@@ -639,172 +688,182 @@ Panel {
             }
 
             // ---- add/edit form ----
-            Column {
-              visible: !!root.editingClient
+            Loader {
+              id: formLoader
+              // Instantiated only while the add/edit form is open, so its
+              // writable text fields don't exist while the panel is idle
+              // (see magnetEditing above).
+              active: !!root.editingClient
+              visible: active
               width: parent.width
-              spacing: Style.space(10)
+              sourceComponent: Component {
+                Column {
+                  width: formLoader.width
+                  spacing: Style.space(10)
 
-              PanelSectionHeader {
-                text: (root.editingClient && root.editingClient.id) ? "EDIT CLIENT" : "ADD CLIENT"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
+                  PanelSectionHeader {
+                    text: (root.editingClient && root.editingClient.id) ? "EDIT CLIENT" : "ADD CLIENT"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                  }
 
-              LabeledField {
-                width: parent.width
-                label: "Name"
-                text: root.formName
-                onTextEdited: root.formName = text
-              }
+                  LabeledField {
+                    width: parent.width
+                    label: "Name"
+                    text: root.formName
+                    onTextEdited: root.formName = text
+                  }
 
-              Dropdown {
-                width: parent.width
-                label: "Client type"
-                value: root.formKind
-                options: [
-                  { value: "transmission", label: "Transmission" },
-                  { value: "qbittorrent", label: "qBittorrent" },
-                  { value: "deluge", label: "Deluge" }
-                ]
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onChanged: function(v) {
-                  root.formKind = v
-                  if (!(root.editingClient && root.editingClient.id)) root.formPort = String(root.defaultPortFor(v))
-                }
-              }
+                  Dropdown {
+                    width: parent.width
+                    label: "Client type"
+                    value: root.formKind
+                    options: [
+                      { value: "transmission", label: "Transmission" },
+                      { value: "qbittorrent", label: "qBittorrent" },
+                      { value: "deluge", label: "Deluge" }
+                    ]
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onChanged: function(v) {
+                      root.formKind = v
+                      if (!(root.editingClient && root.editingClient.id)) root.formPort = String(root.defaultPortFor(v))
+                    }
+                  }
 
-              RowLayout {
-                width: parent.width
-                spacing: Style.space(10)
+                  RowLayout {
+                    width: parent.width
+                    spacing: Style.space(10)
 
-                LabeledField {
-                  Layout.fillWidth: true
-                  label: "Host"
-                  text: root.formHost
-                  onTextEdited: root.formHost = text
-                }
+                    LabeledField {
+                      Layout.fillWidth: true
+                      label: "Host"
+                      text: root.formHost
+                      onTextEdited: root.formHost = text
+                    }
 
-                LabeledField {
-                  Layout.preferredWidth: Style.space(90)
-                  label: "Port"
-                  text: root.formPort
-                  onTextEdited: root.formPort = text.replace(/[^0-9]/g, "").slice(0, 5)
-                }
-              }
+                    LabeledField {
+                      Layout.preferredWidth: Style.space(90)
+                      label: "Port"
+                      text: root.formPort
+                      onTextEdited: root.formPort = text.replace(/[^0-9]/g, "").slice(0, 5)
+                    }
+                  }
 
-              LabeledField {
-                visible: root.formKind === "transmission"
-                width: parent.width
-                label: "RPC path"
-                placeholderText: "/transmission/rpc"
-                text: root.formPath
-                onTextEdited: root.formPath = text
-              }
+                  LabeledField {
+                    visible: root.formKind === "transmission"
+                    width: parent.width
+                    label: "RPC path"
+                    placeholderText: "/transmission/rpc"
+                    text: root.formPath
+                    onTextEdited: root.formPath = text
+                  }
 
-              LabeledField {
-                visible: root.formKind !== "deluge"
-                width: parent.width
-                label: "Username"
-                text: root.formUsername
-                onTextEdited: root.formUsername = text
-              }
+                  LabeledField {
+                    visible: root.formKind !== "deluge"
+                    width: parent.width
+                    label: "Username"
+                    text: root.formUsername
+                    onTextEdited: root.formUsername = text
+                  }
 
-              LabeledField {
-                width: parent.width
-                label: "Password"
-                password: true
-                placeholderText: (root.editingClient && root.editingClient.id) ? "Leave blank to keep saved password" : ""
-                text: root.formPassword
-                onTextEdited: root.formPassword = text
-              }
+                  LabeledField {
+                    width: parent.width
+                    label: "Password"
+                    password: true
+                    placeholderText: (root.editingClient && root.editingClient.id) ? "Leave blank to keep saved password" : ""
+                    text: root.formPassword
+                    onTextEdited: root.formPassword = text
+                  }
 
-              // qBittorrent >= 5.2.0 only: an API key replaces the
-              // username/password login entirely (sent as a bearer token),
-              // so it's offered only for that client type. Setting one here
-              // does not clear a saved password -- either can still be used
-              // to Test/Save, but the qBittorrent backend prefers the key
-              // whenever it's present.
-              LabeledField {
-                visible: root.formKind === "qbittorrent"
-                width: parent.width
-                label: "API key (optional, replaces password)"
-                password: true
-                placeholderText: (root.editingClient && root.editingClient.id) ? "Leave blank to keep saved API key" : "qbt_…"
-                text: root.formApiKey
-                onTextEdited: root.formApiKey = text
-              }
+                  // qBittorrent >= 5.2.0 only: an API key replaces the
+                  // username/password login entirely (sent as a bearer token),
+                  // so it's offered only for that client type. Setting one here
+                  // does not clear a saved password -- either can still be used
+                  // to Test/Save, but the qBittorrent backend prefers the key
+                  // whenever it's present.
+                  LabeledField {
+                    visible: root.formKind === "qbittorrent"
+                    width: parent.width
+                    label: "API key (optional, replaces password)"
+                    password: true
+                    placeholderText: (root.editingClient && root.editingClient.id) ? "Leave blank to keep saved API key" : "qbt_…"
+                    text: root.formApiKey
+                    onTextEdited: root.formApiKey = text
+                  }
 
-              Toggle {
-                width: parent.width
-                label: "Use HTTPS"
-                checked: root.formSsl
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: root.formSsl = !root.formSsl
-              }
+                  Toggle {
+                    width: parent.width
+                    label: "Use HTTPS"
+                    checked: root.formSsl
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.formSsl = !root.formSsl
+                  }
 
-              Text {
-                visible: torrents.probeResult !== null
-                width: parent.width
-                text: torrents.probeResult
-                  ? (torrents.probeResult.ok
-                    ? ("Connected — " + torrents.probeResult.torrentCount + (torrents.probeResult.truncated ? "+" : "") + " torrent(s) found")
-                    : ("Connection failed: " + torrents.probeResult.error))
-                  : ""
-                textFormat: Text.PlainText
-                color: torrents.probeResult && torrents.probeResult.ok ? root.foreground : root.urgentColor
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-              }
+                  Text {
+                    visible: torrents.probeResult !== null
+                    width: parent.width
+                    text: torrents.probeResult
+                      ? (torrents.probeResult.ok
+                        ? ("Connected — " + torrents.probeResult.torrentCount + (torrents.probeResult.truncated ? "+" : "") + " torrent(s) found")
+                        : ("Connection failed: " + torrents.probeResult.error))
+                      : ""
+                    textFormat: Text.PlainText
+                    color: torrents.probeResult && torrents.probeResult.ok ? root.foreground : root.urgentColor
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.WordWrap
+                  }
 
-              // credentialStorageBlocked gets its own blocking modal
-              // (credentialStorageWarning, below) so it can't be missed or
-              // auto-dismissed; this inline text is only for other failures
-              // (validation, unreachable host, etc.) that don't need a
-              // blocking decision.
-              Text {
-                visible: torrents.clientFormError !== "" && !torrents.credentialStorageBlocked
-                width: parent.width
-                text: torrents.clientFormError
-                textFormat: Text.PlainText
-                color: root.urgentColor
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-              }
+                  // credentialStorageBlocked gets its own blocking modal
+                  // (credentialStorageWarning, below) so it can't be missed or
+                  // auto-dismissed; this inline text is only for other failures
+                  // (validation, unreachable host, etc.) that don't need a
+                  // blocking decision.
+                  Text {
+                    visible: torrents.clientFormError !== "" && !torrents.credentialStorageBlocked
+                    width: parent.width
+                    text: torrents.clientFormError
+                    textFormat: Text.PlainText
+                    color: root.urgentColor
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.WordWrap
+                  }
 
-              RowLayout {
-                width: parent.width
-                spacing: Style.space(8)
+                  RowLayout {
+                    width: parent.width
+                    spacing: Style.space(8)
 
-                Button {
-                  text: torrents.probing ? "Testing…" : "Test connection"
-                  bordered: true
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  enabled: root.formHost.trim() !== "" && !torrents.probing
-                  onClicked: torrents.probeConnection(root.currentFormFields(), (root.editingClient && root.editingClient.id) ? root.editingClient.id : "")
-                }
+                    Button {
+                      text: torrents.probing ? "Testing…" : "Test connection"
+                      bordered: true
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      enabled: root.formHost.trim() !== "" && !torrents.probing
+                      onClicked: torrents.probeConnection(root.currentFormFields(), (root.editingClient && root.editingClient.id) ? root.editingClient.id : "")
+                    }
 
-                Item { Layout.fillWidth: true }
+                    Item { Layout.fillWidth: true }
 
-                Button {
-                  text: "Cancel"
-                  bordered: true
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: root.closeClientForm()
-                }
+                    Button {
+                      text: "Cancel"
+                      bordered: true
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: root.closeClientForm()
+                    }
 
-                Button {
-                  text: torrents.busyOp === "save-client" ? "Saving…" : "Save"
-                  bordered: true
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  enabled: root.formName.trim() !== "" && root.formHost.trim() !== "" && torrents.busyOp === ""
-                  onClicked: root.saveForm()
+                    Button {
+                      text: torrents.busyOp === "save-client" ? "Saving…" : "Save"
+                      bordered: true
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      enabled: root.formName.trim() !== "" && root.formHost.trim() !== "" && torrents.busyOp === ""
+                      onClicked: root.saveForm()
+                    }
+                  }
                 }
               }
             }
